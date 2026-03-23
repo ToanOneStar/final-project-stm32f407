@@ -23,6 +23,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "ads1115.h" /* Driver ADS1115 I2C ADC */
+#include <stdio.h>   /* sscanf() – parse chuoi "R:xx P:xx Y:xx" */
 #include <stdlib.h>  /* atoi() */
 
 /* USER CODE END Includes */
@@ -55,12 +56,18 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 
-volatile int k = 0;               /* Bien nhan gia tri tu CC1310 */
+volatile int k = 0;               /* Bien nhan gia tri tu CC1310 (legacy) */
 volatile uint8_t uart_rx_byte;    /* Buffer nhan 1 byte qua UART interrupt */
-volatile uint8_t uart_rx_buf[16]; /* Buffer tich luy chuoi ASCII */
+volatile uint8_t uart_rx_buf[48]; /* Buffer tich luy chuoi ASCII (du cho
+                                     "R:+180.00 P:+180.00 Y:+180.00") */
 volatile uint8_t uart_rx_idx = 0; /* Chi so vi tri trong buffer */
 
-float j = 0.0f; /* Bien luu dien ap ADC doc tu ADS1115 (mV) */
+/* --- 3 bien goc 3 truc tu MPU6050 (doc tu CC1310 qua UART) --- */
+volatile float imu_roll = 0.0f;  /* Goc lan [deg], quay quanh truc X */
+volatile float imu_pitch = 0.0f; /* Goc nghieng [deg], quay quanh truc Y */
+volatile float imu_yaw = 0.0f;   /* Goc xoay [deg], quay quanh truc Z */
+
+uint16_t j = 0; /* Bien luu raw ADC 16-bit khong dau tu ADS1115 (0-65535) */
 
 /* USER CODE END PV */
 
@@ -125,6 +132,24 @@ int main(void) {
 
   /* Dat duty cycle 50% (Pulse = Period/2 = 8399/2 ~ 4200) */
   __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 4200);
+
+  /* Trang thai ban dau: PB0 = 1, PB1 = 0 */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+
+  /* Bat TIM3 Update Interrupt – toggle GPIO tai cuoi moi chu ky */
+  HAL_TIM_Base_Start_IT(&htim3);
+
+  /* Cau hinh TIM3 CH2 Output Compare Timing tai Pulse = Period/2 = 4200
+   * Khong xuat ra chan (OCMODE_TIMING), chi tao ngat tai diem giua chu ky.
+   * Ket hop voi Update Event se cho 2 lan toggle moi chu ky => T_dao = T/2 */
+  TIM_OC_InitTypeDef sConfigOC2 = {0};
+  sConfigOC2.OCMode     = TIM_OCMODE_TIMING;
+  sConfigOC2.Pulse      = (htim3.Init.Period + 1) / 2; /* 4200 */
+  sConfigOC2.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC2.OCFastMode = TIM_OCFAST_DISABLE;
+  HAL_TIM_OC_ConfigChannel(&htim3, &sConfigOC2, TIM_CHANNEL_2);
+  HAL_TIM_OC_Start_IT(&htim3, TIM_CHANNEL_2);
 
   /* Bat dau nhan UART interrupt tung byte tu CC1310 */
   HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
@@ -409,6 +434,9 @@ static void MX_GPIO_Init(void) {
                     GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0 | GPIO_PIN_1, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOD,
                     LD4_Pin | LD3_Pin | LD5_Pin | LD6_Pin | Audio_RST_Pin,
                     GPIO_PIN_RESET);
@@ -440,6 +468,13 @@ static void MX_GPIO_Init(void) {
   GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PB0 PB1 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /*Configure GPIO pin : BOOT1_Pin */
   GPIO_InitStruct.Pin = BOOT1_Pin;
@@ -482,6 +517,38 @@ static void MX_GPIO_Init(void) {
 
 /* USER CODE BEGIN 4 */
 
+/* Ham noi dung: dao PB0 va PB1 nguoc nhau */
+static inline void toggle_PB0_PB1(void) {
+  if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0) == GPIO_PIN_SET) {
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+  } else {
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+  }
+}
+
+/**
+ * @brief  Callback khi TIM3 tran (Update Event) – cuoi chu ky.
+ *         Toggle PB0/PB1 tai diem t = 0, T, 2T, ...
+ */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+  if (htim->Instance == TIM3) {
+    toggle_PB0_PB1();
+  }
+}
+
+/**
+ * @brief  Callback khi TIM3 CH2 Compare Match – giua chu ky (t = T/2).
+ *         Toggle PB0/PB1 tai diem t = T/2, 3T/2, 5T/2, ...
+ *         Ket hop voi PeriodElapsedCallback: chu ky dao = T/2.
+ */
+void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim) {
+  if (htim->Instance == TIM3 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
+    toggle_PB0_PB1();
+  }
+}
+
 /**
  * @brief  Callback khi nhan xong 1 byte qua UART (goi tu HAL_UART_IRQHandler)
  * @param  huart: con tro UART handle
@@ -490,12 +557,29 @@ static void MX_GPIO_Init(void) {
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
   if (huart->Instance == USART2) {
     if (uart_rx_byte == '\n') {
-      /* Ket thuc chuoi: them null terminator va parse sang int */
+      /* Ket thuc chuoi: them null terminator */
       uart_rx_buf[uart_rx_idx] = '\0';
-      k = atoi((char *)uart_rx_buf);
-      uart_rx_idx = 0; /* Reset chi so cho lan nhan tiep theo */
+      uart_rx_idx = 0;
+
+      /*
+       * Parse chuoi dinh dang: "R:12.34 P:-5.67 Y:45.00"
+       * sscanf tim chinh xac theo format nay.
+       * Neu parse thanh cong (tra ve 3), cap nhat 3 bien goc.
+       */
+      float tmp_roll = 0.0f, tmp_pitch = 0.0f, tmp_yaw = 0.0f;
+      int parsed = sscanf((char *)uart_rx_buf, "R:%f P:%f Y:%f", &tmp_roll,
+                          &tmp_pitch, &tmp_yaw);
+      if (parsed == 3) {
+        imu_roll = tmp_roll;
+        imu_pitch = tmp_pitch;
+        imu_yaw = tmp_yaw;
+
+        /* Giu lai bien k de tuong thich nguoc (lay phan nguyen cua roll) */
+        k = (int)tmp_roll;
+      }
+
     } else if (uart_rx_byte == '\r') {
-      /* Bo qua ky tu carriage return (Windows-style \r\n) */
+      /* Bo qua carriage return */
     } else {
       /* Tich luy byte vao buffer (tranh tran bo nho) */
       if (uart_rx_idx < sizeof(uart_rx_buf) - 1) {

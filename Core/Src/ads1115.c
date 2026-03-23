@@ -13,7 +13,6 @@ uint16_t ADS1115_port = ADS1115_MUX_AIN0;          // Default
 
 uint8_t ADS1115_config[2];
 uint8_t ADS1115_rawValue[2];
-float ADS1115_voltCoef; // Voltage coefficient.
 
 /* Function definitions. */
 HAL_StatusTypeDef ADS1115_Init(I2C_HandleTypeDef *handler, uint16_t setDataRate,
@@ -22,34 +21,6 @@ HAL_StatusTypeDef ADS1115_Init(I2C_HandleTypeDef *handler, uint16_t setDataRate,
 
   ADS1115_dataRate = setDataRate;
   ADS1115_pga = setPGA;
-
-  // Voltage coefficient update.
-  switch (ADS1115_pga) {
-
-  case ADS1115_PGA_TWOTHIRDS:
-    ADS1115_voltCoef = 0.1875;
-    break;
-
-  case ADS1115_PGA_ONE:
-    ADS1115_voltCoef = 0.125;
-    break;
-
-  case ADS1115_PGA_TWO:
-    ADS1115_voltCoef = 0.0625;
-    break;
-
-  case ADS1115_PGA_FOUR:
-    ADS1115_voltCoef = 0.03125;
-    break;
-
-  case ADS1115_PGA_EIGHT:
-    ADS1115_voltCoef = 0.015625;
-    break;
-
-  case ADS1115_PGA_SIXTEEN:
-    ADS1115_voltCoef = 0.0078125;
-    break;
-  }
 
   if (HAL_I2C_IsDeviceReady(&ADS1115_I2C_Handler,
                             (uint16_t)(ADS1115_devAddress << 1), 5,
@@ -60,7 +31,8 @@ HAL_StatusTypeDef ADS1115_Init(I2C_HandleTypeDef *handler, uint16_t setDataRate,
   }
 }
 
-HAL_StatusTypeDef ADS1115_readSingleEnded(uint16_t muxPort, float *voltage) {
+HAL_StatusTypeDef ADS1115_readSingleEnded(uint16_t muxPort,
+                                          uint16_t *rawValue) {
 
   ADS1115_config[0] = ADS1115_OS | muxPort | ADS1115_pga | ADS1115_MODE;
   ADS1115_config[1] = ADS1115_dataRate | ADS1115_COMP_MODE | ADS1115_COMP_POL |
@@ -89,9 +61,8 @@ HAL_StatusTypeDef ADS1115_readSingleEnded(uint16_t muxPort, float *voltage) {
                          (uint16_t)((ADS1115_devAddress << 1) | 0x1),
                          ADS1115_CONVER_REG, 1, ADS1115_rawValue, 2,
                          ADS1115_TIMEOUT) == HAL_OK) {
-      *voltage =
-          (float)(((int16_t)(ADS1115_rawValue[0] << 8) | ADS1115_rawValue[1]) *
-                  ADS1115_voltCoef);
+      /* Ghep 2 byte thanh gia tri uint16_t khong dau (0 - 65535) */
+      *rawValue = (uint16_t)((ADS1115_rawValue[0] << 8) | ADS1115_rawValue[1]);
       return HAL_OK;
     }
   }
