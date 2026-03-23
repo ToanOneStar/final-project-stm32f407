@@ -54,6 +54,6 @@
 /* Function prototypes. */
 HAL_StatusTypeDef ADS1115_Init(I2C_HandleTypeDef *handler, uint16_t setDataRate,
                                uint16_t setPGA);
-HAL_StatusTypeDef ADS1115_readSingleEnded(uint16_t muxPort, float *voltage);
+HAL_StatusTypeDef ADS1115_readSingleEnded(uint16_t muxPort, uint16_t *rawValue);
 
 #endif /* ADS1115_H */
