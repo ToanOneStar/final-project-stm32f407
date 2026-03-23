@@ -69,6 +69,12 @@ volatile float imu_yaw = 0.0f;   /* Goc xoay [deg], quay quanh truc Z */
 
 uint16_t j = 0; /* Bien luu raw ADC 16-bit khong dau tu ADS1115 (0-65535) */
 
+/* ======= DEBUG: dem so byte nhan duoc tu CC1310 ======= */
+// volatile uint16_t stm_uart_rx_count = 0; /* Tong so byte da nhan */
+// volatile uint16_t stm_newline_count = 0; /* So lan nhan duoc '\n' */
+// volatile uint16_t stm_parse_ok = 0;     /* So lan parse thanh cong */
+volatile uint16_t stm_parse_fail = 0; /* So lan parse that bai */
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -144,8 +150,8 @@ int main(void) {
    * Khong xuat ra chan (OCMODE_TIMING), chi tao ngat tai diem giua chu ky.
    * Ket hop voi Update Event se cho 2 lan toggle moi chu ky => T_dao = T/2 */
   TIM_OC_InitTypeDef sConfigOC2 = {0};
-  sConfigOC2.OCMode     = TIM_OCMODE_TIMING;
-  sConfigOC2.Pulse      = (htim3.Init.Period + 1) / 2; /* 4200 */
+  sConfigOC2.OCMode = TIM_OCMODE_TIMING;
+  sConfigOC2.Pulse = (htim3.Init.Period + 1) / 2; /* 4200 */
   sConfigOC2.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC2.OCFastMode = TIM_OCFAST_DISABLE;
   HAL_TIM_OC_ConfigChannel(&htim3, &sConfigOC2, TIM_CHANNEL_2);
@@ -392,7 +398,7 @@ static void MX_USART2_UART_Init(void) {
 
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
+  huart2.Init.BaudRate = 9600;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;
@@ -556,26 +562,33 @@ void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim) {
  */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
   if (huart->Instance == USART2) {
+    // stm_uart_rx_count++;  /* dem byte nhan duoc */
+
     if (uart_rx_byte == '\n') {
+      // stm_newline_count++;  /* dem so '\n' nhan duoc */
       /* Ket thuc chuoi: them null terminator */
       uart_rx_buf[uart_rx_idx] = '\0';
       uart_rx_idx = 0;
 
       /*
-       * Parse chuoi dinh dang: "R:12.34 P:-5.67 Y:45.00"
-       * sscanf tim chinh xac theo format nay.
-       * Neu parse thanh cong (tra ve 3), cap nhat 3 bien goc.
+       * Parse chuoi dinh dang: "R:427 P:-2584 Y:-125013"
+       * CC1310 gui so nguyen x1000 de tranh sscanf %f
+       * (arm-none-eabi-gcc khong ho tro %f trong sscanf mac dinh).
+       * Chia cho 1000.0f de co lai gia tri goc float.
        */
-      float tmp_roll = 0.0f, tmp_pitch = 0.0f, tmp_yaw = 0.0f;
-      int parsed = sscanf((char *)uart_rx_buf, "R:%f P:%f Y:%f", &tmp_roll,
-                          &tmp_pitch, &tmp_yaw);
+      int tmp_r = 0, tmp_p = 0, tmp_y = 0;
+      int parsed =
+          sscanf((char *)uart_rx_buf, "R:%d P:%d Y:%d", &tmp_r, &tmp_p, &tmp_y);
       if (parsed == 3) {
-        imu_roll = tmp_roll;
-        imu_pitch = tmp_pitch;
-        imu_yaw = tmp_yaw;
+        imu_roll = tmp_r / 1000.0f;
+        imu_pitch = tmp_p / 1000.0f;
+        imu_yaw = tmp_y / 1000.0f;
 
         /* Giu lai bien k de tuong thich nguoc (lay phan nguyen cua roll) */
-        k = (int)tmp_roll;
+        k = tmp_r / 1000;
+        // stm_parse_ok++;  /* dem so lan parse thanh cong */
+      } else {
+        // stm_parse_fail++;  /* dem so lan parse that bai */
       }
 
     } else if (uart_rx_byte == '\r') {
