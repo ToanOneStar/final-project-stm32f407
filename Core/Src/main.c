@@ -37,20 +37,39 @@
 /* USER CODE BEGIN PD */
 
 /* =========================================================
- * CAU HINH TAN SO PWM – chi can sua PWM_FREQ_HZ
+ * CAU HINH DANG SONG XEN KE N1/N2
  * =========================================================
- * TIM3 nam tren bus APB1. Khi APB1 prescaler != 1:
- *   TIM3_CLK = PCLK1 x 2 = (168MHz / 4) x 2 = 84 MHz
+ * TIM3 tren bus APB1 (APB1 prescaler = 4):
+ *   TIM3_CLK = PCLK1 x 2 = (168MHz/4) x 2 = 84 MHz
  *
- * Cong thuc:
- *   PWM_PERIOD = TIM3_CLK / (PWM_PRESCALER+1) / PWM_FREQ_HZ - 1
- *   PWM_PULSE  = (PWM_PERIOD + 1) / 2   (duty cycle 50%)
+ * f_key  = tan so co ban (nua chu ky T/2)
+ * T_HALF = 1 / (2 * f_key)  =>  ARR_HALF = TIM3_CLK / (2*f_key) - 1
+ * TIM3 nap lai ARR_HALF => moi interrupt = 1 nua chu ky (T/2)
+ *
+ * Trong moi interrupt ta dem:
+ *   - N1 nua chu ky (toggle nhanh – f_key)
+ *   - N2 x 3 nua chu ky (toggle cham – f_key/3)
+ * Va dao cuc logic moi lan doi nhom.
+ *
+ * Kenh xuat (GPIO toggle thu cong):
+ *   PC6 = cuc hien tai
+ *   PB5 = dao nguoc PC6
  * ========================================================= */
-#define PWM_FREQ_HZ     10000UL          /* <<< Chi chinh so nay de doi tan so */
-#define TIM3_CLK_HZ     84000000UL      /* TIM3 input clock = 84 MHz (fix cung kinh truoc) */
-#define PWM_PRESCALER   0U              /* Prescaler = 0 (chia 1, giu do phan giai cao nhat) */
-#define PWM_PERIOD      ((uint32_t)(TIM3_CLK_HZ / ((PWM_PRESCALER) + 1U) / (PWM_FREQ_HZ)) - 1U)
-#define PWM_PULSE       ((uint32_t)((PWM_PERIOD + 1U) / 2U))  /* Duty 50% */
+#define TIM3_CLK_HZ     84000000UL      /* TIM3 input clock = 84 MHz      */
+#define PWM_PRESCALER   0U              /* Prescaler = 0                  */
+
+#define PWM_F_KEY       10000UL         /* Tan so co ban f_key = 50 kHz   */
+#define PWM_N1          2U              /* So nua chu ky T/2 trong nhom 1  */
+#define PWM_N2          1U              /* So nua chu ky 3T/2 trong nhom 2 */
+
+/* ARR cho 1 nua chu ky T/2:  TIM3_CLK / (2 * f_key) - 1 = 84e6/100000 - 1 = 839 */
+#define PWM_ARR_HALF    ((uint32_t)(TIM3_CLK_HZ / (2UL * PWM_F_KEY)) - 1U)
+
+/* TIM1 tren APB2 (prescaler=4): TIM1_CLK = PCLK2 x 2 = 84 MHz (giong TIM3)
+ * ARR cho 1 chu ky day du tai f_key: 84e6 / 50000 - 1 = 1679
+ * CCR = ARR + 1 = 1680  =>  duty 100% trong PWM1 mode */
+#define TIM1_CLK_HZ     84000000UL
+#define TIM1_ARR_FKEY   ((uint32_t)(TIM1_CLK_HZ / PWM_F_KEY) - 1U)
 
 /* USER CODE END PD */
 
@@ -91,6 +110,18 @@ uint16_t j = 0; /* Bien luu raw ADC 16-bit khong dau tu ADS1115 (0-65535) */
 // volatile uint16_t stm_newline_count = 0; /* So lan nhan duoc '\n' */
 // volatile uint16_t stm_parse_ok = 0;     /* So lan parse thanh cong */
 volatile uint16_t stm_parse_fail = 0; /* So lan parse that bai */
+
+/* ======= Bien trang thai dang song xen ke N1/N2 ======= */
+/* Nhom A: N1 nua chu ky (moi nua chu ky la 1 toggle T/2)  */
+/* Nhom B: N2 lan 3 nua chu ky (moi lan B gom 3 half-IRQ)  */
+/*                                                          */
+/* pwm_group  = 0 => dang trong nhom A (N1 x T/2)           */
+/* pwm_group  = 1 => dang trong nhom B (N2 x 3T/2)          */
+/* pwm_cnt    = dem so lan toggle trong nhom hien tai        */
+/* pwm_pol    = cuc hien tai cua PC6 (0=LOW, 1=HIGH)        */
+volatile uint8_t  pwm_group = 0;  /* 0=nhom A, 1=nhom B    */
+volatile uint16_t pwm_cnt   = 0;  /* dem T/2 trong nhom     */
+volatile uint8_t  pwm_pol   = 0;  /* cuc hien tai PC6       */
 
 /* USER CODE END PV */
 
@@ -152,13 +183,44 @@ int main(void)
   MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
 
-  /* --- PWM Complementary bang phan cung, KHONG can ngat ---
-   * TIM3 CH1 (PA6): OCPolarity = HIGH  → xuat PWM goc
-   * TIM3 CH2 (PA7): OCPolarity = LOW   → phan cung tu dao nguoc tin hieu
-   * Ca 2 kenh cung Pulse = 4200 (duty 50%), cung Period = 8399.
-   * Ket qua: PA6 va PA7 luon nguoc nhau, khong ton CPU. */
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1); /* PA6 – PWM goc  */
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2); /* PA7 – PWM dao  */
+  /* =========================================================
+   * THUAT TOAN DANG SONG XEN KE N1/N2
+   * ---------------------------------------------------------
+   * PC6 (PB5 dao nguoc) duoc dieu khien bang GPIO toggle
+   * trong TIM3 Update interrupt.
+   *
+   * TIM3 ARR = PWM_ARR_HALF => moi interrupt = 1 nua chu ky.
+   * Nhom A: N1 nua chu ky lien tiep (f_key)
+   * Nhom B: N2 x 3 nua chu ky (f_key/3)
+   * Moi lan doi nhom: dao cuc PC6/PB5.
+   * ========================================================= */
+
+  /* Tat PWM hardware – dung GPIO toggle thu cong */
+  HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_2);
+
+  /* Cau hinh PC6, PB5 thanh GPIO output (ghi de AF cua TIM3) */
+  {
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Mode  = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull  = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    gpio.Pin   = GPIO_PIN_6;
+    HAL_GPIO_Init(GPIOC, &gpio);
+    gpio.Pin   = GPIO_PIN_5;
+    HAL_GPIO_Init(GPIOB, &gpio);
+  }
+
+  /* Trang thai ban dau: PC6=LOW, PB5=HIGH */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);
+  pwm_pol   = 0;
+  pwm_group = 0;
+  pwm_cnt   = 0;
+
+  /* Thiet lap ARR = T/2 period */
+  __HAL_TIM_SET_AUTORELOAD(&htim3, PWM_ARR_HALF);
+  HAL_TIM_Base_Start_IT(&htim3); /* Bat TIM3 base + Update interrupt */
 
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
 
@@ -371,7 +433,7 @@ static void MX_TIM1_Init(void)
   htim1.Instance = TIM1;
   htim1.Init.Prescaler = 0;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 8399;
+  htim1.Init.Period = TIM1_ARR_FKEY;  /* f_key = 50 kHz, ARR = 1679 */
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
@@ -417,7 +479,8 @@ static void MX_TIM1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN TIM1_Init 2 */
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 8399);
+  /* CCR = ARR + 1 => duty 100% (CNT < CCR luon dung trong PWM1 mode) */
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, TIM1_ARR_FKEY + 1U);
   /* USER CODE END TIM1_Init 2 */
   HAL_TIM_MspPostInit(&htim1);
 
@@ -445,7 +508,7 @@ static void MX_TIM3_Init(void)
   htim3.Instance = TIM3;
   htim3.Init.Prescaler = 0;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 8399;
+  htim3.Init.Period = PWM_ARR_HALF;     /* ARR = T/2 period cho dang song N1/N2   */
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
@@ -482,11 +545,10 @@ static void MX_TIM3_Init(void)
   }
   /* USER CODE BEGIN TIM3_Init 2 */
 
-  /* Dat Pulse = PWM_PULSE (50% duty) cho ca 2 kenh
-   * CH1 (PA6): HIGH polarity  => PWM goc
-   * CH2 (PA7): LOW  polarity  => tu dao nguoc boi phan cung */
-  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, PWM_PULSE);
-  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, PWM_PULSE);
+  /* Dang song N1/N2 dung GPIO toggle thu cong trong IRQ,
+   * khong can set CCR (PWM compare). Chi can bat NVIC. */
+  HAL_NVIC_SetPriority(TIM3_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(TIM3_IRQn);
 
   /* USER CODE END TIM3_Init 2 */
   HAL_TIM_MspPostInit(&htim3);
@@ -635,6 +697,65 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+/**
+ * @brief  TIM3 Update interrupt callback – tao dang song xen ke N1/N2
+ *
+ * Moi lan goi = 1 nua chu ky T/2 troi qua.
+ *
+ * Nhom A (pwm_group=0): N1 nua chu ky lien tiep.
+ *   - Moi IRQ: toggle PC6/PB5 ngay (1 canh len hoac xuong).
+ *   - Sau N1 toggle: doi sang nhom B, dao cuc ban dau cua nhom.
+ *
+ * Nhom B (pwm_group=1): N2 lan 3T/2.
+ *   - Moi 3T/2 = 3 nua chu ky => chi toggle 1 lan moi 3 IRQ.
+ *   - Sau N2*3 IRQ: doi sang nhom A, dao cuc ban dau cua nhom.
+ *
+ * PC6 = pwm_pol;  PB5 = !pwm_pol;
+ */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance != TIM3) return;
+
+  if (pwm_group == 0)
+  {
+    /* ---- NHOM A: moi IRQ = 1 canh toggle (nua chu ky T/2) ---- */
+    pwm_pol ^= 1U;
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,
+                      pwm_pol ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5,
+                      pwm_pol ? GPIO_PIN_RESET : GPIO_PIN_SET);
+
+    pwm_cnt++;
+    if (pwm_cnt >= (uint16_t)PWM_N1)
+    {
+      /* Het nhom A, sang nhom B; dao cuc (khong toggle them, chi doi nhom) */
+      pwm_group = 1;
+      pwm_cnt   = 0;
+    }
+  }
+  else
+  {
+    /* ---- NHOM B: moi 3 IRQ = 1 canh toggle (3T/2) ---- */
+    pwm_cnt++;
+    if (pwm_cnt % 3U == 0U)
+    {
+      /* Toggle tai moc 3, 6, 9 ... */
+      pwm_pol ^= 1U;
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,
+                        pwm_pol ? GPIO_PIN_SET : GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5,
+                        pwm_pol ? GPIO_PIN_RESET : GPIO_PIN_SET);
+    }
+
+    if (pwm_cnt >= (uint16_t)(PWM_N2 * 3U))
+    {
+      /* Het nhom B, sang nhom A */
+      pwm_group = 0;
+      pwm_cnt   = 0;
+    }
+  }
+}
 
 /**
  * @brief  Callback khi nhan xong 1 byte qua UART (goi tu HAL_UART_IRQHandler)
