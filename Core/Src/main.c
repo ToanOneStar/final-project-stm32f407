@@ -22,9 +22,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "ads1115.h" /* Driver ADS1115 I2C ADC */
-#include <stdio.h>   /* sscanf() – parse chuoi "R:xx P:xx Y:xx" */
-#include <stdlib.h>  /* atoi() */
+#include "ads1115.h"  /* Driver ADS1115 I2C ADC                */
+#include "arm_math.h" /* CMSIS-DSP: arm_pid_f32, float32_t     */
+#include <stdio.h>    /* snprintf() / sscanf()                  */
 
 /* USER CODE END Includes */
 
@@ -55,21 +55,39 @@
  *   PC6 = cuc hien tai
  *   PB5 = dao nguoc PC6
  * ========================================================= */
-#define TIM3_CLK_HZ     84000000UL      /* TIM3 input clock = 84 MHz      */
-#define PWM_PRESCALER   0U              /* Prescaler = 0                  */
+#define TIM3_CLK_HZ     84000000UL   /* TIM3 input clock = 84 MHz      */
+#define PWM_PRESCALER   0U           /* Prescaler = 0                  */
 
-#define PWM_F_KEY       10000UL         /* Tan so co ban f_key = 50 kHz   */
-#define PWM_N1          2U              /* So nua chu ky T/2 trong nhom 1  */
-#define PWM_N2          1U              /* So nua chu ky 3T/2 trong nhom 2 */
+#define PWM_F_KEY       10000UL      /* Tan so co ban f_key = 10 kHz   */
 
-/* ARR cho 1 nua chu ky T/2:  TIM3_CLK / (2 * f_key) - 1 = 84e6/100000 - 1 = 839 */
+/* ARR cho 1 nua chu ky T/2:  TIM3_CLK / (2*f_key) - 1 = 84e6/20000 - 1 = 4199 */
 #define PWM_ARR_HALF    ((uint32_t)(TIM3_CLK_HZ / (2UL * PWM_F_KEY)) - 1U)
 
-/* TIM1 tren APB2 (prescaler=4): TIM1_CLK = PCLK2 x 2 = 84 MHz (giong TIM3)
- * ARR cho 1 chu ky day du tai f_key: 84e6 / 50000 - 1 = 1679
- * CCR = ARR + 1 = 1680  =>  duty 100% trong PWM1 mode */
+/* TIM1 tren APB2: TIM1_CLK = 84 MHz, ARR = 84e6/f_key - 1, CCR=ARR+1 (100% duty) */
 #define TIM1_CLK_HZ     84000000UL
 #define TIM1_ARR_FKEY   ((uint32_t)(TIM1_CLK_HZ / PWM_F_KEY) - 1U)
+
+/* =========================================================
+ * HANG SO HE THONG PFM (tu paper, n=1)
+ * =========================================================
+ * U_max = 2*sqrt(2)*E/pi (E = DC source voltage)
+ * delta   = U_new / U_max   in (0, 1]
+ * delta_d = (3 - 1/delta) / 2   [Eq.19, n=1]
+ * N1 + N2 = PFM_N_TOTAL = 7
+ * N1: le (odd), N2: chan (even)
+ * ========================================================= */
+#define PFM_U_MAX        10.8f  /* U_max (V): 2*sqrt(2)*E/pi, E=12V          */
+#define PFM_U_BASE       10.8f  /* U_base khi delta=1 (V)                    */
+#define PFM_DU_MIN       (-10.8f)/* Gioi han duoi PID output (V) = -U_max   */
+#define PFM_DU_MAX       0.0f   /* Gioi han tren: khong che vuot U_max       */
+#define PFM_DELTA_MIN    0.3f   /* delta toi thieu (tranh 1/delta -> inf)    */
+#define PFM_PID_TS       0.001f /* Sampling time PID = 1 ms                 */
+#define PFM_MAX_TOTAL    12U    /* Gioi han N1+N2 toi da (tuy chinh)         */
+
+/* Mo phong plant: ix_sim_amp = pfm_delta * IX_SIM_MAX
+ * Tai delta=1.0 -> ix_sim = IX_SIM_MAX = 0.3 A
+ * PID dieu chinh delta de dua ix_sim ve Iset */
+#define IX_SIM_MAX       0.3f   /* Dong toi da mo phong (A) tai delta=1     */
 
 /* USER CODE END PD */
 
@@ -112,16 +130,37 @@ uint16_t j = 0; /* Bien luu raw ADC 16-bit khong dau tu ADS1115 (0-65535) */
 volatile uint16_t stm_parse_fail = 0; /* So lan parse that bai */
 
 /* ======= Bien trang thai dang song xen ke N1/N2 ======= */
-/* Nhom A: N1 nua chu ky (moi nua chu ky la 1 toggle T/2)  */
-/* Nhom B: N2 lan 3 nua chu ky (moi lan B gom 3 half-IRQ)  */
-/*                                                          */
-/* pwm_group  = 0 => dang trong nhom A (N1 x T/2)           */
-/* pwm_group  = 1 => dang trong nhom B (N2 x 3T/2)          */
-/* pwm_cnt    = dem so lan toggle trong nhom hien tai        */
-/* pwm_pol    = cuc hien tai cua PC6 (0=LOW, 1=HIGH)        */
-volatile uint8_t  pwm_group = 0;  /* 0=nhom A, 1=nhom B    */
-volatile uint16_t pwm_cnt   = 0;  /* dem T/2 trong nhom     */
-volatile uint8_t  pwm_pol   = 0;  /* cuc hien tai PC6       */
+/* pwm_group = 0: nhom A (N1 x T/2)   pwm_group = 1: nhom B (N2 x 3T/2) */
+/* pfm_N1/N2 duoc cap nhat boi PFM_Update() moi 1 ms tu main loop        */
+volatile uint8_t  pwm_group = 0;  /* 0=nhom A, 1=nhom B      */
+volatile uint16_t pwm_cnt   = 0;  /* dem nua chu ky trong nhom */
+volatile uint8_t  pwm_pol   = 0;  /* cuc hien tai PC6 (0=LOW, 1=HIGH) */
+volatile uint8_t  pfm_N1    = 2U; /* cap nhat boi PFM_Update()  */
+volatile uint8_t  pfm_N2    = 1U; /* cap nhat boi PFM_Update()  */
+
+/* ======= CMSIS-DSP PID instance ======= */
+arm_pid_instance_f32 pid_ix;      /* PID dieu khien dong I_x (FPU) */
+
+/* ======= Bien PFM (debug / cap nhat boi PFM_Update) ======= */
+volatile float pfm_delta    = 1.0f;   /* delta = U_new / U_max in [DELTA_MIN,1] */
+volatile float pfm_delta_d  = 1.0f;   /* delta_d = N1/(N1+N2)                   */
+volatile float pfm_u_new    = PFM_U_BASE; /* U_new (V)                          */
+volatile float pfm_du       = 0.0f;   /* PID output DeltaU (V) [debug]          */
+
+/* ======= Test mode: Iset tu UART, Ix gia lap ======= */
+volatile float ix_set_amp   = 0.1f;   /* Iset nhan tu UART (A), mac dinh 100 mA */
+volatile float ix_sim_amp   = 0.0f;   /* Ix gia lap (hoi tu ve ix_set_amp)      */
+volatile uint8_t new_setpoint = 0;    /* Co: co setpoint moi tu UART            */
+volatile uint32_t uart_last_rx_ms = 0U; /* Thoi diem nhan byte cuoi (idle timeout) */
+
+
+/* ======= BENCHMARK: DWT cycle counter (168 MHz) ======= */
+/* Ghi lai so cycles thuc thi cua tung buoc chinh:        */
+volatile uint32_t bench_pid_cy    = 0U; /* arm_pid_f32() [cycles]         */
+volatile uint32_t bench_pfm_cy    = 0U; /* PFM_ComputeN1N2() [cycles]     */
+volatile uint32_t bench_total_cy  = 0U; /* Tong PFM_Update() [cycles]     */
+volatile float    bench_pid_us    = 0.0f; /* arm_pid_f32() [us]           */
+volatile float    bench_total_us  = 0.0f; /* Tong PFM_Update() [us]       */
 
 /* USER CODE END PV */
 
@@ -137,11 +176,21 @@ static void MX_TIM1_Init(void);
 void MX_USB_HOST_Process(void);
 
 /* USER CODE BEGIN PFP */
-
+static void PFM_Update(float i_set, float i_meas);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* =========================================================
+ * DWT CYCLE COUNTER — do thoi gian thuc thi (168 MHz)
+ * 1 cycle = 1/168e6 s ~ 5.95 ns
+ * Cach dung:
+ *   DWT_START();  ... code can do ...  uint32_t cy = DWT_STOP();
+ * ========================================================= */
+#define DWT_START()  do { DWT->CYCCNT = 0U; } while(0)
+#define DWT_STOP()   (DWT->CYCCNT)
+#define DWT_US(cy)   ((float)(cy) / 168.0f)   /* cycles -> microseconds */
 
 /* USER CODE END 0 */
 
@@ -184,22 +233,22 @@ int main(void)
   /* USER CODE BEGIN 2 */
 
   /* =========================================================
-   * THUAT TOAN DANG SONG XEN KE N1/N2
+   * KHOI TAO PFM + CMSIS-DSP PID
    * ---------------------------------------------------------
-   * PC6 (PB5 dao nguoc) duoc dieu khien bang GPIO toggle
-   * trong TIM3 Update interrupt.
+   * PC6/PB5: GPIO toggle trong TIM3 IRQ (moi IRQ = T/2)
+   * pfm_N1/N2 duoc cap nhat boi PFM_Update() tu main loop
    *
-   * TIM3 ARR = PWM_ARR_HALF => moi interrupt = 1 nua chu ky.
-   * Nhom A: N1 nua chu ky lien tiep (f_key)
-   * Nhom B: N2 x 3 nua chu ky (f_key/3)
-   * Moi lan doi nhom: dao cuc PC6/PB5.
+   * CMSIS-DSP arm_pid_f32:
+   *   Input  = error = Iset - Ix
+   *   Output = DeltaU (V)
+   *   Ki_cmsis = Ki_thuc * Ts (Ts = 1 ms)
    * ========================================================= */
 
-  /* Tat PWM hardware – dung GPIO toggle thu cong */
+  /* Tat PWM hardware TIM3 – dung GPIO toggle thu cong */
   HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
   HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_2);
 
-  /* Cau hinh PC6, PB5 thanh GPIO output (ghi de AF cua TIM3) */
+  /* Cau hinh PC6, PB5 thanh GPIO Output Push-Pull */
   {
     GPIO_InitTypeDef gpio = {0};
     gpio.Mode  = GPIO_MODE_OUTPUT_PP;
@@ -218,17 +267,34 @@ int main(void)
   pwm_group = 0;
   pwm_cnt   = 0;
 
-  /* Thiet lap ARR = T/2 period */
+  /* Bat TIM3 base + Update IRQ (moi IRQ = T/2 = 1/2*f_key) */
   __HAL_TIM_SET_AUTORELOAD(&htim3, PWM_ARR_HALF);
-  HAL_TIM_Base_Start_IT(&htim3); /* Bat TIM3 base + Update interrupt */
+  HAL_TIM_Base_Start_IT(&htim3);
 
+  /* Bat TIM1 CH1 PWM 100% duty tai f_key */
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
 
-  /* Bat dau nhan UART interrupt tung byte tu CC1310 */
-  HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
+  /* Khoi tao CMSIS-DSP PID
+   * Kp = 0.3  (P thuan)
+   * Ki_cmsis = Ki_thuc * Ts = 0.5 * 0.001 = 0.0005
+   * Kd = 0    (tat D-term khi test)
+   * arm_pid_init_f32 tinh A0=Kp+Ki+Kd, A1=-Kp-2Kd, A2=Kd
+   * va reset state[3] = {0} */
+  pid_ix.Kp = 0.3f;
+  pid_ix.Ki = 0.0005f;
+  pid_ix.Kd = 0.0f;
+  arm_pid_init_f32(&pid_ix, 1);
 
-  /* Khoi tao ADS1115 voi I2C1, Data Rate 128SPS, PGA +/-6.144V (do duoc 3V3) */
+  /* Khoi tao ADS1115 (giu lai cho phan cung sau) */
   ADS1115_Init(&hi2c1, ADS1115_DATA_RATE_128, ADS1115_PGA_TWOTHIRDS);
+
+  /* Bat UART interrupt de nhan lenh "I:xxx" tu terminal */
+  HAL_UART_Receive_IT(&huart2, (uint8_t *)&uart_rx_byte, 1);
+
+  /* Kich hoat DWT Cycle Counter (reset = 0, enable = 1) */
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT      = 0U;
+  DWT->CTRL       |= DWT_CTRL_CYCCNTENA_Msk;
 
   /* USER CODE END 2 */
 
@@ -240,21 +306,82 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-    /* Doc ADC tu ADS1115 kenh AIN0 (Single-Ended), ket qua tinh bang mV luu vao
-     * j */
-    ADS1115_readSingleEnded(ADS1115_MUX_AIN1, &j);
+    /* =========================================================
+     * PID LOOP: 1 kHz (1 ms)
+     * ---------------------------------------------------------
+     * 1. Ix gia lap hoi tu ve ix_set_amp (first-order, tau~20ms)
+     * 2. Neu co setpoint moi tu UART: reset tich phan PID
+     * 3. Goi PFM_Update() -> tinh N1/N2 moi
+     * Debug UART 5 Hz: in trang thai
+     * ========================================================= */
+    static uint32_t pid_tick = 0;
+    uint32_t now_ms = HAL_GetTick();
 
-    HAL_Delay(10); /* Cho 10ms giua moi lan doc */
+    if ((now_ms - pid_tick) >= 1U) {
+      pid_tick = now_ms;
 
-    /* Vi du: Tang dan duty cycle tu 0% -> 100% roi quay lai */
-    //    for (uint16_t pulse = 0; pulse <= 839; pulse += 84) {
-    //      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pulse);
-    //      HAL_Delay(100);
-    //    }
-    //    for (uint16_t pulse = 839; pulse > 0; pulse -= 84) {
-    //      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pulse);
-    //      HAL_Delay(100);
-    //    }
+      /* --- Ix mo phong theo output dieu khien (pfm_delta)
+       * Thay vi follow Iset truc tiep, ix_sim hoi tu ve
+       * pfm_delta * IX_SIM_MAX - tao vong kin co y nghia:
+       *   Iset=0.10A -> PID can delta=0.333 -> N1=1,N2=2
+       *   Iset=0.20A -> PID can delta=0.667 -> N1=2,N2=1
+       *   Iset=0.30A -> PID can delta=1.000 -> N1=1,N2=0 --- */
+      ix_sim_amp += 0.05f * (pfm_delta * IX_SIM_MAX - ix_sim_amp);
+
+      /* --- Neu co setpoint moi: reset tich phan tranh wind-up --- */
+      if (new_setpoint) {
+        arm_pid_reset_f32(&pid_ix);
+        new_setpoint = 0;
+      }
+
+      /* --- PID + PFM update (do thoi gian thuc thi bang DWT) --- */
+      DWT_START();
+      PFM_Update(ix_set_amp, ix_sim_amp);
+      bench_total_cy = DWT_STOP();
+      bench_total_us = DWT_US(bench_total_cy);
+    }
+
+    /* =========================================================
+     * UART IDLE-TIMEOUT PARSE: 50 ms
+     * ---------------------------------------------------------
+     * Neu buffer co du lieu (uart_rx_idx > 0) va
+     * khong co byte moi trong 50 ms -> tu dong parse.
+     * Giai quyet van de Hercules gui khong co newline.
+     * ========================================================= */
+    static uint32_t uart_idle_checked = 0;
+    if ((HAL_GetTick() - uart_idle_checked) >= 10U) {
+      uart_idle_checked = HAL_GetTick();
+      if (uart_rx_idx > 0 &&
+          (HAL_GetTick() - uart_last_rx_ms) >= 50U)
+      {
+        /* Force parse: them null terminator va reset index */
+        uart_rx_buf[uart_rx_idx] = '\0';
+        uart_rx_idx = 0;
+
+        int tmp_i_ma = -1;
+        if (sscanf((char *)uart_rx_buf, "I:%d", &tmp_i_ma) == 1
+            && tmp_i_ma >= 0)
+        {
+          ix_set_amp   = (float)tmp_i_ma / 1000.0f;
+          new_setpoint = 1;
+        }
+      }
+    }
+
+    /* --- Debug UART: 5 Hz (moi 200 ms) --- */
+    // static uint32_t dbg_tick = 0;
+    // if ((HAL_GetTick() - dbg_tick) >= 200U) {
+    //   dbg_tick = HAL_GetTick();
+    //   char buf[160];
+    //   int len = snprintf(buf, sizeof(buf),
+    //       "Iset=%.3f Ix=%.3f dU=%.3f d=%.3f dd=%.3f N1=%u N2=%u\r\n",
+    //       ix_set_amp, ix_sim_amp,
+    //       pfm_du, pfm_delta, pfm_delta_d,
+    //       (unsigned)pfm_N1, (unsigned)pfm_N2);
+    //   HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)len, 10U);
+    // }
+
+
   }
   /* USER CODE END 3 */
 }
@@ -699,6 +826,112 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 /**
+ * @brief  Tinh xap xi phan so toi gian tot nhat cua delta_d
+ *
+ * Tim N1, N2 nguyen duong toi thieu sao cho N1/(N1+N2) xap xi delta_d.
+ * Thuat toan: duyet mau so (total = N1+N2) tu 1 den PFM_MAX_TOTAL,
+ *   - tu_so p = round(delta_d * total)
+ *   - tinh sai so |p/total - delta_d|
+ *   - chon cap (N1=p, N2=total-p) co sai so nho nhat.
+ * => mau so nho nhat dat xap xi tot nhat (phan so toi gian).
+ *
+ * Vi du:
+ *   delta_d = 0.714  =>  total=7, p=5  =>  N1=5, N2=2  (sai so ~0)
+ *   delta_d = 0.333  =>  total=3, p=1  =>  N1=1, N2=2
+ *   delta_d = 1.0    =>  N1=1, N2=0   (dac biet)
+ *   delta_d = 0.5    =>  total=2, p=1  =>  N1=1, N2=1
+ */
+static void PFM_ComputeN1N2(float delta_d, uint8_t *pN1, uint8_t *pN2)
+{
+  /* Trang thai dac biet: delta_d = 1 => chi dung f_key, khong co f_key/3 */
+  if (delta_d >= 1.0f) { *pN1 = 1U; *pN2 = 0U; return; }
+
+  uint8_t best_N1 = 1U;
+  uint8_t best_N2 = 1U;
+  float   best_err = 1.0f;
+
+  for (uint8_t total = 1U; total <= (uint8_t)PFM_MAX_TOTAL; total++)
+  {
+    /* p = round(delta_d * total), clamp [1, total] */
+    uint8_t p = (uint8_t)(delta_d * (float)total + 0.5f);
+    if (p < 1U)     p = 1U;
+    if (p > total)  p = total;
+
+    float dd  = (float)p / (float)total;
+    float err = dd - delta_d;
+    if (err < 0.0f) err = -err;
+
+    if (err < best_err)
+    {
+      best_err = err;
+      best_N1  = p;
+      best_N2  = total - p;
+    }
+
+    /* Neu sai so bang 0 (chinh xac tuyet doi): dung luon */
+    if (best_err < 1e-6f) break;
+  }
+
+  *pN1 = best_N1;
+  *pN2 = best_N2;
+}
+
+/**
+ * @brief  PFM_Update — Cap nhat N1/N2 tu Iset va Ix_meas qua PID DSP
+ *
+ * Chuoi tinh toan (paper Eq.6 + Eq.19, n=1):
+ *   error   = i_set - i_meas
+ *   DeltaU  = arm_pid_f32(&pid_ix, error)   [CMSIS-DSP, FPU ~50 cycles]
+ *   U_new   = U_base + DeltaU               [clamp]
+ *   delta   = U_new / U_max                 [Eq.6]
+ *   delta_d = (3 - 1/delta) / 2            [Eq.19, n=1]
+ *   (N1, N2): xap xi delta_d = N1/(N1+N2)  [phan so toi gian, tong min]
+ *
+ * @param i_set   dong dat (A)
+ * @param i_meas  dong do (A) — gia lap trong test mode
+ */
+static void PFM_Update(float i_set, float i_meas)
+{
+  /* --- Buoc 1: PID (CMSIS-DSP, FPU hardware) --- */
+  float32_t error = (float32_t)(i_set - i_meas);
+  DWT_START();
+  float32_t du    = arm_pid_f32(&pid_ix, error);
+  bench_pid_cy  = DWT_STOP();
+  bench_pid_us  = DWT_US(bench_pid_cy);
+
+  /* Clamp DeltaU */
+  if (du > PFM_DU_MAX) du = PFM_DU_MAX;
+  if (du < PFM_DU_MIN) du = PFM_DU_MIN;
+  pfm_du = du;
+
+  /* --- Buoc 2: U_new = U_base + DeltaU (clamp) --- */
+  float u_new = PFM_U_BASE + (float)du;
+  if (u_new > PFM_U_MAX)                 u_new = PFM_U_MAX;
+  if (u_new < PFM_U_MAX * PFM_DELTA_MIN) u_new = PFM_U_MAX * PFM_DELTA_MIN;
+
+  /* --- Buoc 3: delta = U_new / U_max  [Eq.6] --- */
+  float delta = u_new / PFM_U_MAX;  /* delta in [PFM_DELTA_MIN, 1.0] */
+
+  /* --- Buoc 4: delta_d tu delta  [Eq.19, n=1: delta_d = (3 - 1/delta)/2] --- */
+  float delta_d = (3.0f - 1.0f / delta) / 2.0f;
+  if (delta_d < 0.0f)  delta_d = 0.0f;
+  if (delta_d > 1.0f)  delta_d = 1.0f;
+
+  /* --- Buoc 5: Tim N1, N2 toi thieu (do cycle PFM_ComputeN1N2) --- */
+  uint8_t N1, N2;
+  DWT_START();
+  PFM_ComputeN1N2(delta_d, &N1, &N2);
+  bench_pfm_cy = DWT_STOP();
+
+  /* --- Cap nhat volatile (TIM3 IRQ doc ngay) --- */
+  pfm_delta   = delta;
+  pfm_delta_d = delta_d;
+  pfm_u_new   = u_new;
+  pfm_N1      = N1;
+  pfm_N2      = N2;
+}
+
+/**
  * @brief  TIM3 Update interrupt callback – tao dang song xen ke N1/N2
  *
  * Moi lan goi = 1 nua chu ky T/2 troi qua.
@@ -727,9 +960,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                       pwm_pol ? GPIO_PIN_RESET : GPIO_PIN_SET);
 
     pwm_cnt++;
-    if (pwm_cnt >= (uint16_t)PWM_N1)
+    if (pwm_cnt >= (uint16_t)pfm_N1)       /* dung volatile pfm_N1 */
     {
-      /* Het nhom A, sang nhom B; dao cuc (khong toggle them, chi doi nhom) */
       pwm_group = 1;
       pwm_cnt   = 0;
     }
@@ -740,7 +972,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     pwm_cnt++;
     if (pwm_cnt % 3U == 0U)
     {
-      /* Toggle tai moc 3, 6, 9 ... */
       pwm_pol ^= 1U;
       HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,
                         pwm_pol ? GPIO_PIN_SET : GPIO_PIN_RESET);
@@ -748,9 +979,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                         pwm_pol ? GPIO_PIN_RESET : GPIO_PIN_SET);
     }
 
-    if (pwm_cnt >= (uint16_t)(PWM_N2 * 3U))
+    if (pwm_cnt >= (uint16_t)(pfm_N2 * 3U)) /* dung volatile pfm_N2 */
     {
-      /* Het nhom B, sang nhom A */
       pwm_group = 0;
       pwm_cnt   = 0;
     }
@@ -766,39 +996,42 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
   if (huart->Instance == USART2) {
     // stm_uart_rx_count++;  /* dem byte nhan duoc */
 
-    if (uart_rx_byte == '\n') {
-      // stm_newline_count++;  /* dem so '\n' nhan duoc */
-      /* Ket thuc chuoi: them null terminator */
-      uart_rx_buf[uart_rx_idx] = '\0';
-      uart_rx_idx = 0;
-
-      /*
-       * Parse chuoi dinh dang: "R:427 P:-2584 Y:-125013"
-       * CC1310 gui so nguyen x1000 de tranh sscanf %f
-       * (arm-none-eabi-gcc khong ho tro %f trong sscanf mac dinh).
-       * Chia cho 1000.0f de co lai gia tri goc float.
-       */
-      int tmp_r = 0, tmp_p = 0, tmp_y = 0;
-      int parsed =
-          sscanf((char *)uart_rx_buf, "R:%d P:%d Y:%d", &tmp_r, &tmp_p, &tmp_y);
-      if (parsed == 3) {
-        imu_roll = tmp_r / 1000.0f;
-        imu_pitch = tmp_p / 1000.0f;
-        imu_yaw = tmp_y / 1000.0f;
-
-        /* Giu lai bien k de tuong thich nguoc (lay phan nguyen cua roll) */
-        k = tmp_r / 1000;
-        // stm_parse_ok++;  /* dem so lan parse thanh cong */
+    if (uart_rx_byte == '\n' || uart_rx_byte == '\r') {
+      /* Ket thuc chuoi: chi parse neu buffer co noi dung (tranh parse 2 lan khi \r\n) */
+      if (uart_rx_idx == 0) {
+        /* Buffer rong = byte thu 2 cua \r\n, bo qua */
       } else {
-        // stm_parse_fail++;  /* dem so lan parse that bai */
+        uart_rx_buf[uart_rx_idx] = '\0';
+        uart_rx_idx = 0;
+
+        /* ---- Uu tien 1: "I:xxx" — dat Iset (mA) ---- */
+        int tmp_i_ma = -1;
+        if (sscanf((char *)uart_rx_buf, "I:%d", &tmp_i_ma) == 1
+            && tmp_i_ma >= 0)
+        {
+          ix_set_amp  = (float)tmp_i_ma / 1000.0f;  /* mA -> A */
+          new_setpoint = 1;
+        }
+        else
+        {
+          /* ---- Uu tien 2: "R:xxx P:xxx Y:xxx" — goc IMU ---- */
+          int tmp_r = 0, tmp_p = 0, tmp_y = 0;
+          int parsed = sscanf((char *)uart_rx_buf,
+                              "R:%d P:%d Y:%d", &tmp_r, &tmp_p, &tmp_y);
+          if (parsed == 3) {
+            imu_roll  = tmp_r / 1000.0f;
+            imu_pitch = tmp_p / 1000.0f;
+            imu_yaw   = tmp_y / 1000.0f;
+            k = tmp_r / 1000;
+          }
+        }
       }
 
-    } else if (uart_rx_byte == '\r') {
-      /* Bo qua carriage return */
     } else {
       /* Tich luy byte vao buffer (tranh tran bo nho) */
       if (uart_rx_idx < sizeof(uart_rx_buf) - 1) {
         uart_rx_buf[uart_rx_idx++] = uart_rx_byte;
+        uart_last_rx_ms = HAL_GetTick(); /* cap nhat timestamp de idle-timeout */
       }
     }
 
