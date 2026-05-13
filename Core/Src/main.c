@@ -24,7 +24,6 @@
 /* USER CODE BEGIN Includes */
 #include "ads1115.h"  /* Driver ADS1115 I2C ADC                */
 #include "arm_math.h" /* CMSIS-DSP: arm_pid_f32, float32_t     */
-#include <stdio.h>    /* snprintf() / sscanf()                  */
 
 /* USER CODE END Includes */
 
@@ -84,10 +83,21 @@
 #define PFM_PID_TS       0.001f /* Sampling time PID = 1 ms                 */
 #define PFM_MAX_TOTAL    12U    /* Gioi han N1+N2 toi da (tuy chinh)         */
 
-/* Mo phong plant: ix_sim_amp = pfm_delta * IX_SIM_MAX
- * Tai delta=1.0 -> ix_sim = IX_SIM_MAX = 0.3 A
- * PID dieu chinh delta de dua ix_sim ve Iset */
-#define IX_SIM_MAX       0.3f   /* Dong toi da mo phong (A) tai delta=1     */
+/* =========================================================
+ * CAU HINH CAM BIEN DONG ACS70331 doc qua ADS1115 A0
+ * =========================================================
+ * ACS70331: VIOUT = VIOUT_Q + Sensitivity * Ia
+ *   VIOUT_Q     = 1666 mV (dien ap khi dong = 0)
+ *   Sensitivity = 216  mV/A
+ *   => Ia = (V_meas_mV - VIOUT_Q_MV) / SENS_MV_A
+ *
+ * ADS1115 PGA = 2/3x (±6.144V), 1 LSB = 0.1875 mV
+ * ========================================================= */
+#define ACS_VIOUT_Q_MV    1666.0f  /* Offset khi I=0A (mV)         */
+#define ACS_SENS_MV_A     216.0f   /* Sensitivity (mV/A)           */
+#define ADS_LSB_MV        0.1875f  /* PGA 2/3x: 6144mV/32768 LSB  */
+#define CURRENT_MEAS_MS   10U      /* Chu ky doc ADS1115 (ms)      */
+#define IX_SET_AMP        0.1f     /* Dong dat Iset (A) = 100 mA   */
 
 /* USER CODE END PD */
 
@@ -110,24 +120,11 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 
-volatile int k = 0;               /* Bien nhan gia tri tu CC1310 (legacy) */
-volatile uint8_t uart_rx_byte;    /* Buffer nhan 1 byte qua UART interrupt */
-volatile uint8_t uart_rx_buf[48]; /* Buffer tich luy chuoi ASCII (du cho
-                                     "R:+180.00 P:+180.00 Y:+180.00") */
-volatile uint8_t uart_rx_idx = 0; /* Chi so vi tri trong buffer */
-
-/* --- 3 bien goc 3 truc tu MPU6050 (doc tu CC1310 qua UART) --- */
-volatile float imu_roll = 0.0f;  /* Goc lan [deg], quay quanh truc X */
-volatile float imu_pitch = 0.0f; /* Goc nghieng [deg], quay quanh truc Y */
-volatile float imu_yaw = 0.0f;   /* Goc xoay [deg], quay quanh truc Z */
-
-uint16_t j = 0; /* Bien luu raw ADC 16-bit khong dau tu ADS1115 (0-65535) */
-
-/* ======= DEBUG: dem so byte nhan duoc tu CC1310 ======= */
-// volatile uint16_t stm_uart_rx_count = 0; /* Tong so byte da nhan */
-// volatile uint16_t stm_newline_count = 0; /* So lan nhan duoc '\n' */
-// volatile uint16_t stm_parse_ok = 0;     /* So lan parse thanh cong */
-volatile uint16_t stm_parse_fail = 0; /* So lan parse that bai */
+/* ======= BIEN DO DONG THUC QUA ADS1115 A0 ======= */
+volatile uint16_t g_adc_raw    = 0;     /* Raw 16-bit tu ADS1115        */
+volatile float    g_voltage_mV = 0.0f;  /* Dien ap VIOUT (mV)           */
+volatile float    g_current_A  = 0.0f;  /* Dong dien do duoc (A)        */
+volatile uint8_t  g_ads_ok     = 0;     /* 1 = ADS1115 doc thanh cong   */
 
 /* ======= Bien trang thai dang song xen ke N1/N2 ======= */
 /* pwm_group = 0: nhom A (N1 x T/2)   pwm_group = 1: nhom B (N2 x 3T/2) */
@@ -147,11 +144,8 @@ volatile float pfm_delta_d  = 1.0f;   /* delta_d = N1/(N1+N2)                   
 volatile float pfm_u_new    = PFM_U_BASE; /* U_new (V)                          */
 volatile float pfm_du       = 0.0f;   /* PID output DeltaU (V) [debug]          */
 
-/* ======= Test mode: Iset tu UART, Ix gia lap ======= */
-volatile float ix_set_amp   = 0.1f;   /* Iset nhan tu UART (A), mac dinh 100 mA */
-volatile float ix_sim_amp   = 0.0f;   /* Ix gia lap (hoi tu ve ix_set_amp)      */
-volatile uint8_t new_setpoint = 0;    /* Co: co setpoint moi tu UART            */
-volatile uint32_t uart_last_rx_ms = 0U; /* Thoi diem nhan byte cuoi (idle timeout) */
+/* ======= Ix do thuc tu ADS1115 ======= */
+volatile float ix_meas_amp  = 0.0f;   /* Ix do thuc tu ADS1115 (A)              */
 
 
 /* ======= BENCHMARK: DWT cycle counter (168 MHz) ======= */
@@ -288,9 +282,6 @@ int main(void)
   /* Khoi tao ADS1115 (giu lai cho phan cung sau) */
   ADS1115_Init(&hi2c1, ADS1115_DATA_RATE_128, ADS1115_PGA_TWOTHIRDS);
 
-  /* Bat UART interrupt de nhan lenh "I:xxx" tu terminal */
-  HAL_UART_Receive_IT(&huart2, (uint8_t *)&uart_rx_byte, 1);
-
   /* Kich hoat DWT Cycle Counter (reset = 0, enable = 1) */
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
   DWT->CYCCNT      = 0U;
@@ -307,12 +298,31 @@ int main(void)
     /* USER CODE BEGIN 3 */
 
     /* =========================================================
+     * DOC DONG DIEN THUC TU ADS1115 A0 (ACS70331)
+     * ---------------------------------------------------------
+     * Moi CURRENT_MEAS_MS ms: doc raw -> voltage -> current
+     * ADS1115 PGA 2/3x: 1 LSB = 0.1875 mV (signed 16-bit)
+     * Ia = (V_meas - VIOUT_Q) / Sensitivity
+     * ========================================================= */
+    static uint32_t adc_tick = 0;
+    if ((HAL_GetTick() - adc_tick) >= CURRENT_MEAS_MS) {
+      adc_tick = HAL_GetTick();
+      uint16_t raw = 0;
+      if (ADS1115_readSingleEnded(ADS1115_MUX_AIN0, &raw) == HAL_OK) {
+        g_adc_raw    = raw;
+        g_voltage_mV = (float)(int16_t)raw * ADS_LSB_MV;
+        g_current_A  = (g_voltage_mV - ACS_VIOUT_Q_MV) / ACS_SENS_MV_A;
+        ix_meas_amp  = g_current_A;  /* Cap nhat Ix cho PID */
+        g_ads_ok     = 1;
+      } else {
+        g_ads_ok     = 0;
+      }
+    }
+
+    /* =========================================================
      * PID LOOP: 1 kHz (1 ms)
      * ---------------------------------------------------------
-     * 1. Ix gia lap hoi tu ve ix_set_amp (first-order, tau~20ms)
-     * 2. Neu co setpoint moi tu UART: reset tich phan PID
-     * 3. Goi PFM_Update() -> tinh N1/N2 moi
-     * Debug UART 5 Hz: in trang thai
+     * Dung ix_meas_amp do thuc tu ADS1115, Iset = IX_SET_AMP
      * ========================================================= */
     static uint32_t pid_tick = 0;
     uint32_t now_ms = HAL_GetTick();
@@ -320,66 +330,12 @@ int main(void)
     if ((now_ms - pid_tick) >= 1U) {
       pid_tick = now_ms;
 
-      /* --- Ix mo phong theo output dieu khien (pfm_delta)
-       * Thay vi follow Iset truc tiep, ix_sim hoi tu ve
-       * pfm_delta * IX_SIM_MAX - tao vong kin co y nghia:
-       *   Iset=0.10A -> PID can delta=0.333 -> N1=1,N2=2
-       *   Iset=0.20A -> PID can delta=0.667 -> N1=2,N2=1
-       *   Iset=0.30A -> PID can delta=1.000 -> N1=1,N2=0 --- */
-      ix_sim_amp += 0.05f * (pfm_delta * IX_SIM_MAX - ix_sim_amp);
-
-      /* --- Neu co setpoint moi: reset tich phan tranh wind-up --- */
-      if (new_setpoint) {
-        arm_pid_reset_f32(&pid_ix);
-        new_setpoint = 0;
-      }
-
       /* --- PID + PFM update (do thoi gian thuc thi bang DWT) --- */
       DWT_START();
-      PFM_Update(ix_set_amp, ix_sim_amp);
+      PFM_Update(IX_SET_AMP, ix_meas_amp);
       bench_total_cy = DWT_STOP();
       bench_total_us = DWT_US(bench_total_cy);
     }
-
-    /* =========================================================
-     * UART IDLE-TIMEOUT PARSE: 50 ms
-     * ---------------------------------------------------------
-     * Neu buffer co du lieu (uart_rx_idx > 0) va
-     * khong co byte moi trong 50 ms -> tu dong parse.
-     * Giai quyet van de Hercules gui khong co newline.
-     * ========================================================= */
-    static uint32_t uart_idle_checked = 0;
-    if ((HAL_GetTick() - uart_idle_checked) >= 10U) {
-      uart_idle_checked = HAL_GetTick();
-      if (uart_rx_idx > 0 &&
-          (HAL_GetTick() - uart_last_rx_ms) >= 50U)
-      {
-        /* Force parse: them null terminator va reset index */
-        uart_rx_buf[uart_rx_idx] = '\0';
-        uart_rx_idx = 0;
-
-        int tmp_i_ma = -1;
-        if (sscanf((char *)uart_rx_buf, "I:%d", &tmp_i_ma) == 1
-            && tmp_i_ma >= 0)
-        {
-          ix_set_amp   = (float)tmp_i_ma / 1000.0f;
-          new_setpoint = 1;
-        }
-      }
-    }
-
-    /* --- Debug UART: 5 Hz (moi 200 ms) --- */
-    // static uint32_t dbg_tick = 0;
-    // if ((HAL_GetTick() - dbg_tick) >= 200U) {
-    //   dbg_tick = HAL_GetTick();
-    //   char buf[160];
-    //   int len = snprintf(buf, sizeof(buf),
-    //       "Iset=%.3f Ix=%.3f dU=%.3f d=%.3f dd=%.3f N1=%u N2=%u\r\n",
-    //       ix_set_amp, ix_sim_amp,
-    //       pfm_du, pfm_delta, pfm_delta_d,
-    //       (unsigned)pfm_N1, (unsigned)pfm_N2);
-    //   HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)len, 10U);
-    // }
 
 
   }
@@ -888,7 +844,7 @@ static void PFM_ComputeN1N2(float delta_d, uint8_t *pN1, uint8_t *pN2)
  *   (N1, N2): xap xi delta_d = N1/(N1+N2)  [phan so toi gian, tong min]
  *
  * @param i_set   dong dat (A)
- * @param i_meas  dong do (A) — gia lap trong test mode
+ * @param i_meas  dong do (A) — do thuc tu ADS1115/ACS70331
  */
 static void PFM_Update(float i_set, float i_meas)
 {
@@ -987,58 +943,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   }
 }
 
-/**
- * @brief  Callback khi nhan xong 1 byte qua UART (goi tu HAL_UART_IRQHandler)
- * @param  huart: con tro UART handle
- * @retval None
- */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-  if (huart->Instance == USART2) {
-    // stm_uart_rx_count++;  /* dem byte nhan duoc */
-
-    if (uart_rx_byte == '\n' || uart_rx_byte == '\r') {
-      /* Ket thuc chuoi: chi parse neu buffer co noi dung (tranh parse 2 lan khi \r\n) */
-      if (uart_rx_idx == 0) {
-        /* Buffer rong = byte thu 2 cua \r\n, bo qua */
-      } else {
-        uart_rx_buf[uart_rx_idx] = '\0';
-        uart_rx_idx = 0;
-
-        /* ---- Uu tien 1: "I:xxx" — dat Iset (mA) ---- */
-        int tmp_i_ma = -1;
-        if (sscanf((char *)uart_rx_buf, "I:%d", &tmp_i_ma) == 1
-            && tmp_i_ma >= 0)
-        {
-          ix_set_amp  = (float)tmp_i_ma / 1000.0f;  /* mA -> A */
-          new_setpoint = 1;
-        }
-        else
-        {
-          /* ---- Uu tien 2: "R:xxx P:xxx Y:xxx" — goc IMU ---- */
-          int tmp_r = 0, tmp_p = 0, tmp_y = 0;
-          int parsed = sscanf((char *)uart_rx_buf,
-                              "R:%d P:%d Y:%d", &tmp_r, &tmp_p, &tmp_y);
-          if (parsed == 3) {
-            imu_roll  = tmp_r / 1000.0f;
-            imu_pitch = tmp_p / 1000.0f;
-            imu_yaw   = tmp_y / 1000.0f;
-            k = tmp_r / 1000;
-          }
-        }
-      }
-
-    } else {
-      /* Tich luy byte vao buffer (tranh tran bo nho) */
-      if (uart_rx_idx < sizeof(uart_rx_buf) - 1) {
-        uart_rx_buf[uart_rx_idx++] = uart_rx_byte;
-        uart_last_rx_ms = HAL_GetTick(); /* cap nhat timestamp de idle-timeout */
-      }
-    }
-
-    /* Kich hoat lai interrupt de nhan byte tiep theo */
-    HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
-  }
-}
 
 /* USER CODE END 4 */
 
