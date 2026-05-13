@@ -57,7 +57,7 @@
 #define TIM3_CLK_HZ     84000000UL   /* TIM3 input clock = 84 MHz      */
 #define PWM_PRESCALER   0U           /* Prescaler = 0                  */
 
-#define PWM_F_KEY       10000UL      /* Tan so co ban f_key = 10 kHz   */
+#define PWM_F_KEY       50512UL      /* Tan so co ban f_key = 10 kHz   */
 
 /* ARR cho 1 nua chu ky T/2:  TIM3_CLK / (2*f_key) - 1 = 84e6/20000 - 1 = 4199 */
 #define PWM_ARR_HALF    ((uint32_t)(TIM3_CLK_HZ / (2UL * PWM_F_KEY)) - 1U)
@@ -563,7 +563,7 @@ static void MX_TIM1_Init(void)
   }
   /* USER CODE BEGIN TIM1_Init 2 */
   /* CCR = ARR + 1 => duty 100% (CNT < CCR luon dung trong PWM1 mode) */
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, TIM1_ARR_FKEY + 1U);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, TIM1_ARR_FKEY * 0.95 + 1U);
   /* USER CODE END TIM1_Init 2 */
   HAL_TIM_MspPostInit(&htim1);
 
