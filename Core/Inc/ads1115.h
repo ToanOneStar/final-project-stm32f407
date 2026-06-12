@@ -49,11 +49,12 @@
 #define ADS1115_CONFIG_REG 0x1
 
 /* TIMEOUT */
-#define ADS1115_TIMEOUT 1 // Timeout for HAL I2C functions.
+#define ADS1115_TIMEOUT 50 // Timeout for HAL I2C functions (ms). Min ~10ms for 128SPS.
 
 /* Function prototypes. */
-HAL_StatusTypeDef ADS1115_Init(I2C_HandleTypeDef *handler, uint16_t setDataRate,
+HAL_StatusTypeDef ADS1115_Init(I2C_HandleTypeDef *hi2c, uint16_t setDataRate,
                                uint16_t setPGA);
-HAL_StatusTypeDef ADS1115_readSingleEnded(uint16_t muxPort, uint16_t *rawValue);
+HAL_StatusTypeDef ADS1115_readSingleEnded(I2C_HandleTypeDef *hi2c,
+                                          uint16_t muxPort, uint16_t *rawValue);
 
 #endif /* ADS1115_H */
