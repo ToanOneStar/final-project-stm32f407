@@ -24,9 +24,11 @@
 /* USER CODE BEGIN Includes */
 #include "ads1115.h"  /* Driver ADS1115 I2C ADC                */
 #include "arm_math.h" /* CMSIS-DSP: arm_pid_f32, float32_t     */
+#include <math.h>     /* sqrtf()                               */
 #include <stdio.h>    /* sprintf()                             */
 #include <stdlib.h>   /* rand(), srand()                       */
 #include <string.h>   /* memset()                              */
+
 
 /* USER CODE END Includes */
 
@@ -502,35 +504,43 @@ int main(void) {
     if ((HAL_GetTick() - adc_tick) >= CURRENT_MEAS_MS) {
       adc_tick = HAL_GetTick();
 
-      /* --- Sensor 1: Doc RMS dong dien tu LTC1966 qua ADC1 (PA1) ---
-       * Oversampling 256 mau: dat do phan giai hieu dung 16-bit
-       * 256 mau x 3.7us/mau ~ 950us tong thoi gian lay mau
-       * Ket qua: adc_16bit tu 0->65520 (tuong duong 16-bit)
-       * Do phan giai: 3300mV / 65535 = 0.05mV/buoc (thay vi 0.8mV)
-       * ------------------------------------------------------- */
-      uint32_t ov_sum = 0;
-      for (uint16_t i = 0; i < 256; i++) {
+/* --- Sensor 1: Software RMS tu ACS70331 qua ADC1 (PA1) ---
+ * Ket noi: ACS70331 Vout -> PA1 (khong can LTC1966)
+ * Lay 200 mau trong ~0.74ms, phu khoang 3.7 chu ky 50Hz
+ * Cong thuc: Var(x) = mean(x^2) - mean(x)^2
+ *            RMS_AC  = sqrt(Var(x))
+ * ------------------------------------------------------- */
+#define SW_RMS_N 200U
+      float sw_sum = 0.0f;    /* Tong mau x         */
+      float sw_sum_sq = 0.0f; /* Tong binh phuong x */
+
+      for (uint16_t i = 0; i < SW_RMS_N; i++) {
         HAL_ADC_Start(&hadc1);
         if (HAL_ADC_PollForConversion(&hadc1, 5U) == HAL_OK) {
-          ov_sum += HAL_ADC_GetValue(&hadc1);
+          float v = (float)HAL_ADC_GetValue(&hadc1) * 3300.0f / 4095.0f;
+          sw_sum += v;
+          sw_sum_sq += v * v;
         }
         HAL_ADC_Stop(&hadc1);
       }
-      /* Chia 16 de lay 16-bit: 256mau / 16 = 16x trung binh (16-bit) */
-      uint16_t adc_16bit = (uint16_t)(ov_sum >> 4);
-      g_adc_raw = adc_16bit; /* Luu lai de xem debug (0->65520) */
 
-      g_voltage_mV = (float)adc_16bit * 3300.0f / 65520.0f; /* 16-bit: 0->3300mV */
+      float sw_mean = sw_sum / (float)SW_RMS_N;
+      /* Phuong sai cua thanh phan AC: Var = mean(x^2) - mean(x)^2 */
+      float sw_var = (sw_sum_sq / (float)SW_RMS_N) - (sw_mean * sw_mean);
+      float sw_vrms = (sw_var > 0.0f) ? sqrtf(sw_var) : 0.0f; /* mV AC RMS */
 
-      float new_current = g_voltage_mV / ACS_SENS_MV_A_1;
+      g_voltage_mV = sw_vrms;        /* mV: bien AC RMS cua dien ap ACS */
+      g_adc_raw = (uint16_t)sw_mean; /* debug: gia tri DC trung binh ~1500mV */
 
-      /* Triet tieu nhieu nen (Deadband): chi ep ve 0A khi rat gan 0 (<5mV) */
-      if (g_voltage_mV < 5.0f) {
+      float new_current = sw_vrms / ACS_SENS_MV_A_1;
+
+      /* Deadband: neu RMS nhieu nen < 5mV thi bao 0A */
+      if (sw_vrms < 5.0f) {
         new_current = 0.0f;
       }
 
-      /* Bo loc nhieu mem EMA (alpha=0.3): phan hoi nhanh hon, van muot */
-      g_current_A = (g_current_A * 0.7f) + (new_current * 0.3f);
+      /* EMA filter (alpha=0.2) */
+      g_current_A = (g_current_A * 0.8f) + (new_current * 0.2f);
       ix1_meas_amp = g_current_A;
       g_ads_ok = 1;
 
