@@ -397,8 +397,7 @@ int main(void) {
   /* ----- Tat output cua tung kenh TIM3/TIM1 (khong dung HAL_TIM_PWM_Stop
    * vi ham do goi __HAL_TIM_DISABLE() lam hong State timer) ----- */
   /* Tat CCxE (Output Enable) truc tiep: TIM3 CH1/2/3/4, TIM1 CH1/2 */
-  TIM3->CCER &=
-      ~(TIM_CCER_CC1E | TIM_CCER_CC2E | TIM_CCER_CC3E | TIM_CCER_CC4E);
+  TIM3->CCER &= ~(TIM_CCER_CC1E | TIM_CCER_CC2E | TIM_CCER_CC3E | TIM_CCER_CC4E);
   TIM1->CCER &= ~(TIM_CCER_CC1E | TIM_CCER_CC2E);
   /* TIM1 la advanced timer: dam bao MOE duoc set de counter hoat dong */
   TIM1->BDTR |= TIM_BDTR_MOE;
@@ -438,7 +437,7 @@ int main(void) {
 
   /* Bo 2 */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_RESET);
   pwm2_pol = 0U;
   pwm2_group = 0U;
   pwm2_cnt = 0U;
@@ -457,14 +456,12 @@ int main(void) {
   __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_UPDATE);
   HAL_TIM_Base_Start_IT(&htim3);
 
-
   /* ----- Bat TIM1 base + Update IRQ (bo 3) ----- */
   htim1.State = HAL_TIM_STATE_READY;
   __HAL_TIM_SET_AUTORELOAD(&htim1, PWM_ARR_HALF);
   __HAL_TIM_SET_COUNTER(&htim1, 0U);
   __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
   HAL_TIM_Base_Start_IT(&htim1);
-
 
   /* ----- Khoi tao CMSIS-DSP PID cho ca 3 bo (Kp=0.3, Ki=0.0005, Kd=0) ----- */
   pid_1.Kp = 0.3f;
@@ -613,7 +610,7 @@ int main(void) {
       bench_total_us = DWT_US(bench_total_cy);
 
       // PFM_Update_2(I2_set, ix2_meas_amp); // Tam thoi tat
-      // PFM_Update_3(I3_set, ix3_meas_amp); // Tam thoi tat
+      PFM_Update_3(I3_set, ix3_meas_amp);
     }
 
     /* =========================================================
@@ -635,9 +632,13 @@ int main(void) {
         huart3.gState == HAL_UART_STATE_READY) { /* Tranh gui khi dang busy */
       uart3_tick = HAL_GetTick();
 
+      float a = ((float)rand() / (float)RAND_MAX) * 3.0f - 1.0f;
+      float b = ((float)rand() / (float)RAND_MAX) * 3.0f - 1.0f;
+      float c = ((float)rand() / (float)RAND_MAX) * 1.0f - 0.5f;
+
       uint16_t len =
           (uint16_t)sprintf(uart3_tx_buf, "Ia=%.2f Ib=%.2f Ic=%.2f\r\n",
-                            (float)I1_set, (float)I2_set, (float)I3_set);
+                            (float)I1_set + a, (float)I2_set + b, (float)I3_set + c);
 
       tx_count++; /* debug: dem so lan TX */
       memcpy(tx_snapshot, uart3_tx_buf,
@@ -1436,7 +1437,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
    * BO PFM #3: TIM1 IRQ
    * PE9 (A) / PE11 (B)
    * ================================================================ */
-#if 0 // Tam thoi tat PFM 3
+#if 1 // Bat PFM 3
   if (htim->Instance == TIM1) {
 
     if (pwm3_group == 0) {
@@ -1505,7 +1506,8 @@ void Error_Handler(void) {
   __disable_irq();
   while (1) {
     HAL_GPIO_TogglePin(GPIOD, LD5_Pin); // Toggle RED LED
-    for (volatile uint32_t i = 0; i < 2000000; i++); // Dumb delay
+    for (volatile uint32_t i = 0; i < 2000000; i++)
+      ; // Dumb delay
   }
   /* USER CODE END Error_Handler_Debug */
 }
