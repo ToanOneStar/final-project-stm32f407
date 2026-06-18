@@ -8,7 +8,7 @@
 static uint8_t current_page = 0;
 static float Rx = 45.1234f, Ry = 90.5678f, Rz = 180.9012f;
 static uint32_t last_btn_press = 0;
-static uint8_t last_btn_state = 0;
+
 static uint32_t oled_tick = 0;
 
 /* Private functions ---------------------------------------------------------*/
@@ -55,15 +55,7 @@ void OLED_App_Init(void) {
 }
 
 void OLED_App_Process(float i1, float i2, float i3) {
-    /* Non-blocking button read with debounce */
-    uint8_t current_btn_state = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0);
-    if (current_btn_state == GPIO_PIN_SET && last_btn_state == GPIO_PIN_RESET) {
-        if (HAL_GetTick() - last_btn_press > 200) {
-            current_page = (current_page + 1) % 3;
-            last_btn_press = HAL_GetTick();
-        }
-    }
-    last_btn_state = current_btn_state;
+    /* Non-blocking OLED screen update */
 
     /* Non-blocking OLED screen update */
     if (HAL_GetTick() - oled_tick > 100) {
@@ -105,5 +97,17 @@ void OLED_App_Process(float i1, float i2, float i3) {
         Rx += 0.0005f; 
         Ry += 0.0005f; 
         Rz += 0.0005f;
+    }
+}
+
+/* EXTI Interrupt Callback for Button B1 (PA0) */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+    if (GPIO_Pin == GPIO_PIN_0) {
+        uint32_t current_time = HAL_GetTick();
+        /* Software Debounce: only accept press if > 200ms since last */
+        if (current_time - last_btn_press > 200) {
+            current_page = (current_page + 1) % 3;
+            last_btn_press = current_time;
+        }
     }
 }

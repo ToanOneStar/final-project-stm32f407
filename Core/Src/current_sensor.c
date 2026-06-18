@@ -14,10 +14,16 @@ static float ix3_meas_amp = 0.0f;
 static float g_current_A = 0.0f;
 static uint32_t adc_tick = 0;
 
+/* DMA Buffer: Since MX configured NbrOfConversion=3 for CH1, we need 3x size */
+static uint16_t adc_dma_buf[SW_RMS_N * 3];
+static volatile uint8_t adc_dma_complete = 0;
+
 /* Public functions ----------------------------------------------------------*/
 
 void CurrentSensor_Init(ADC_HandleTypeDef* hadc) {
     p_hadc = hadc;
+    /* Start the first DMA transfer */
+    HAL_ADC_Start_DMA(p_hadc, (uint32_t*)adc_dma_buf, SW_RMS_N * 3);
 }
 
 void CurrentSensor_Process(void) {
@@ -26,39 +32,46 @@ void CurrentSensor_Process(void) {
     if ((HAL_GetTick() - adc_tick) >= CURRENT_MEAS_MS) {
         adc_tick = HAL_GetTick();
 
-        float sw_sum = 0.0f;
-        float sw_sum_sq = 0.0f;
+        /* Only process if DMA has finished collecting SW_RMS_N samples */
+        if (adc_dma_complete) {
+            adc_dma_complete = 0; /* Reset flag */
 
-        for (uint16_t i = 0; i < SW_RMS_N; i++) {
-            HAL_ADC_Start(p_hadc);
-            if (HAL_ADC_PollForConversion(p_hadc, 5U) == HAL_OK) {
-                float v = (float)HAL_ADC_GetValue(p_hadc) * 3300.0f / 4095.0f;
+            float sw_sum = 0.0f;
+            float sw_sum_sq = 0.0f;
+
+            /* Process the buffer. Since NbrOfConversion=3, we step by 3 */
+            for (uint16_t i = 0; i < SW_RMS_N * 3; i += 3) {
+                float v = (float)adc_dma_buf[i] * 3300.0f / 4095.0f;
                 sw_sum += v;
                 sw_sum_sq += v * v;
             }
-            HAL_ADC_Stop(p_hadc);
+
+            float sw_mean = sw_sum / (float)SW_RMS_N;
+            float sw_var = (sw_sum_sq / (float)SW_RMS_N) - (sw_mean * sw_mean);
+            float sw_vrms = (sw_var > 0.0f) ? sqrtf(sw_var) : 0.0f;
+
+            float new_current = sw_vrms / ACS_SENS_MV_A_1;
+
+            if (sw_vrms < 5.0f) {
+                new_current = 0.0f;
+            }
+
+            g_current_A = (g_current_A * 0.8f) + (new_current * 0.2f);
+            ix1_meas_amp = g_current_A;
+            
+            ix2_meas_amp = 0.0f;
+            ix3_meas_amp = 0.0f;
+
+            /* Restart DMA for the next batch */
+            HAL_ADC_Start_DMA(p_hadc, (uint32_t*)adc_dma_buf, SW_RMS_N * 3);
         }
+    }
+}
 
-        float sw_mean = sw_sum / (float)SW_RMS_N;
-        /* Variance of AC component: Var = mean(x^2) - mean(x)^2 */
-        float sw_var = (sw_sum_sq / (float)SW_RMS_N) - (sw_mean * sw_mean);
-        float sw_vrms = (sw_var > 0.0f) ? sqrtf(sw_var) : 0.0f; /* mV AC RMS */
-
-        float new_current = sw_vrms / ACS_SENS_MV_A_1;
-
-        /* Deadband: if RMS noise < 5mV then 0A */
-        if (sw_vrms < 5.0f) {
-            new_current = 0.0f;
-        }
-
-        /* EMA filter (alpha=0.2) */
-        g_current_A = (g_current_A * 0.8f) + (new_current * 0.2f);
-        ix1_meas_amp = g_current_A;
-        
-        /* Currently only 1 sensor is implemented with ADC1. 
-         * Mocking I2 and I3 for the rest. */
-        ix2_meas_amp = 0.0f;
-        ix3_meas_amp = 0.0f;
+/* DMA Complete Callback */
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
+    if (hadc == p_hadc) {
+        adc_dma_complete = 1;
     }
 }
 
