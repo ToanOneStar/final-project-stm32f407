@@ -22,6 +22,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "ssd1306.h"
+#include "ssd1306_fonts.h"
+
 #include "ads1115.h"  /* Driver ADS1115 I2C ADC                */
 #include "arm_math.h" /* CMSIS-DSP: arm_pid_f32, float32_t     */
 #include <math.h>     /* sqrtf()                               */
@@ -167,6 +170,9 @@ TIM_HandleTypeDef htim3;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
+SPI_HandleTypeDef hspi1;
+uint8_t current_page = 0;
+float Rx = 45.1234f, Ry = 90.5678f, Rz = 180.9012f;
 
 /* ======= BIEN DO DIEN AP AC RMS — LTC1966 qua ADC1 PA0 ======= */
 volatile uint32_t g_ltc_adc_raw = 0U; /* Raw 12-bit tu ADC1            */
@@ -254,6 +260,7 @@ volatile float bench_total_us = 0.0f;  /* Tong PFM_Update() [us]       */
 
 /* USER CODE BEGIN PV */
 
+
 /* ======= UART3 RX tu LabVIEW ======= */
 volatile float I1_set = 0.0f; /* Dong dat 1 (A) nhan tu LabVIEW */
 volatile float I2_set = 0.0f; /* Dong dat 2 (A) nhan tu LabVIEW */
@@ -279,6 +286,7 @@ char tx_snapshot[64];           /* Chuoi TX cuoi cung STM32 gui — debug */
 /* dbg_init_step: tang dan theo tung buoc trong USER CODE BEGIN 2.
  *   0 = chua vao USER CODE BEGIN 2
  *   1 = sau CCER disable
+ */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -293,6 +301,7 @@ static void MX_I2C1_Init(void);
 void MX_USB_HOST_Process(void);
 
 /* USER CODE BEGIN PFP */
+static void MX_SPI1_Init(void);
 static void PFM_Update_1(float i_set, float i_meas);
 static void PFM_Update_2(float i_set, float i_meas);
 static void PFM_Update_3(float i_set, float i_meas);
@@ -300,6 +309,19 @@ static void PFM_Update_3(float i_set, float i_meas);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void float_to_str(float val, char* buf) {
+    if (val < 0) { *buf++ = '-'; val = -val; }
+    int int_part = (int)val;
+    int frac_part = (int)((val - int_part) * 10000);
+    char int_str[10]; int i = 0;
+    if (int_part == 0) { int_str[i++] = '0'; } else { while (int_part > 0) { int_str[i++] = (int_part % 10) + '0'; int_part /= 10; } }
+    while (i > 0) { *buf++ = int_str[--i]; }
+    *buf++ = '.';
+    buf[3] = (frac_part % 10) + '0'; frac_part /= 10;
+    buf[2] = (frac_part % 10) + '0'; frac_part /= 10;
+    buf[1] = (frac_part % 10) + '0'; frac_part /= 10;
+    buf[0] = (frac_part % 10) + '0'; buf += 4; *buf = '\0';
+}
 
 /* =========================================================
  * LTC1966 — Doc dien ap AC RMS qua ADC1 (PA0, 12-bit, Vref=3.3V)
@@ -378,10 +400,14 @@ int main(void) {
   MX_ADC1_Init();
   MX_USART3_UART_Init();
   MX_I2C1_Init();
+  MX_SPI1_Init();
 
   HAL_GPIO_WritePin(GPIOD, LD6_Pin, GPIO_PIN_SET); // Bật Blue LED sau khi Init Peripherals
 
   /* USER CODE BEGIN 2 */
+  ssd1306_Init();
+  ssd1306_Fill(Black);
+  ssd1306_UpdateScreen();
 
   /* =========================================================
    * KHOI TAO 3 BO PFM + CMSIS-DSP PID
@@ -487,7 +513,7 @@ int main(void) {
   DWT->CYCCNT = 0U;
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
-  HAL_UART_Receive_IT(&huart3, &rx_data, 1);
+  HAL_UART_Receive_IT(&huart3, (uint8_t *)&rx_data, 1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -497,9 +523,52 @@ int main(void) {
     MX_USB_HOST_Process();
 
     /* USER CODE BEGIN 3 */
-    HAL_GPIO_TogglePin(GPIOD,
-                       LD4_Pin); // Chớp LED xanh lá để báo hiệu mạch còn sống
-    HAL_Delay(500);
+    static uint32_t last_btn_press = 0;
+    static uint8_t last_btn_state = 0;
+    uint8_t current_btn_state = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0);
+    if (current_btn_state == GPIO_PIN_SET && last_btn_state == GPIO_PIN_RESET) {
+        if (HAL_GetTick() - last_btn_press > 200) {
+            current_page = (current_page + 1) % 3;
+            last_btn_press = HAL_GetTick();
+        }
+    }
+    last_btn_state = current_btn_state;
+
+    static uint32_t oled_tick = 0;
+    if (HAL_GetTick() - oled_tick > 100) {
+        oled_tick = HAL_GetTick();
+        char buf1[32]; char buf2[32]; char val_str[16];
+        ssd1306_Fill(Black);
+        if (current_page == 0) {
+            float_to_str(ix1_meas_amp, val_str);
+            strcpy(buf1, "I1: "); strcat(buf1, val_str); strcat(buf1, " A");
+            float_to_str(ix2_meas_amp, val_str);
+            strcpy(buf2, "I2: "); strcat(buf2, val_str); strcat(buf2, " A");
+        } 
+        else if (current_page == 1) {
+            float_to_str(ix3_meas_amp, val_str);
+            strcpy(buf1, "I3: "); strcat(buf1, val_str); strcat(buf1, " A");
+            float_to_str(Rx, val_str);
+            strcpy(buf2, "Rx: "); strcat(buf2, val_str); strcat(buf2, " deg");
+        } 
+        else {
+            float_to_str(Ry, val_str);
+            strcpy(buf1, "Ry: "); strcat(buf1, val_str); strcat(buf1, " deg");
+            float_to_str(Rz, val_str);
+            strcpy(buf2, "Rz: "); strcat(buf2, val_str); strcat(buf2, " deg");
+        }
+        ssd1306_SetCursor(5, 15);
+        ssd1306_WriteString(buf1, Font_7x10, White);
+        ssd1306_SetCursor(5, 40);
+        ssd1306_WriteString(buf2, Font_7x10, White);
+        ssd1306_UpdateScreen();
+        Rx += 0.0005f; Ry += 0.0005f; Rz += 0.0005f;
+    }
+    static uint32_t led_tick = 0;
+    if (HAL_GetTick() - led_tick >= 500) {
+        led_tick = HAL_GetTick();
+        HAL_GPIO_TogglePin(GPIOD, LD4_Pin); // Chớp LED xanh lá để báo hiệu mạch còn sống
+    }
     /* =========================================================
      * DOC DONG DIEN TU 3 CAM BIEN ACS70331 QUA 1 ADS1115 (I2C1)
      * ---------------------------------------------------------
@@ -1143,11 +1212,49 @@ static void MX_GPIO_Init(void) {
   HAL_GPIO_Init(MEMS_INT2_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+  GPIO_InitStruct.Pin = GPIO_PIN_12 | GPIO_PIN_14;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_8;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12 | GPIO_PIN_14, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);
+
+  GPIO_InitStruct.Pin = GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+static void MX_SPI1_Init(void) {
+  __HAL_RCC_SPI1_CLK_ENABLE();
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK) { Error_Handler(); }
+}
+
 
 /**
  * @brief  Tinh xap xi phan so toi gian tot nhat cua delta_d
