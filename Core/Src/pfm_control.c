@@ -219,6 +219,9 @@ static void PFM_Update_3(float i_set, float i_meas) {
 
 /* Public Functions ----------------------------------------------------------*/
 
+extern TIM_HandleTypeDef htim1;
+extern TIM_HandleTypeDef htim3;
+
 void PFM_Control_Init(void) {
   /* Initialize PID coefficients */
   pid_1.Kp = 2.0f;
@@ -235,6 +238,38 @@ void PFM_Control_Init(void) {
   pid_3.Ki = 0.1f;
   pid_3.Kd = 0.0f;
   arm_pid_init_f32(&pid_3, 1);
+
+  /* Override TIM AF mode - Configure PFM pins as Output Push-Pull */
+  GPIO_InitTypeDef gpio = {0};
+  gpio.Mode  = GPIO_MODE_OUTPUT_PP;
+  gpio.Pull  = GPIO_NOPULL;
+  gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+
+  /* GPIOC: PC6, PC8, PC9 */
+  gpio.Pin = GPIO_PIN_6 | GPIO_PIN_8 | GPIO_PIN_9;
+  HAL_GPIO_Init(GPIOC, &gpio);
+
+  /* GPIOB: PB5 */
+  gpio.Pin = GPIO_PIN_5;
+  HAL_GPIO_Init(GPIOB, &gpio);
+
+  /* GPIOE: PE9, PE11 */
+  gpio.Pin = GPIO_PIN_9 | GPIO_PIN_11;
+  HAL_GPIO_Init(GPIOE, &gpio);
+
+  /* Set initial states */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);
+  
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_SET);
+  
+  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11, GPIO_PIN_SET);
+
+  /* Start PFM Timers to trigger HAL_TIM_PeriodElapsedCallback */
+  HAL_TIM_Base_Start_IT(&htim1);
+  HAL_TIM_Base_Start_IT(&htim3);
 }
 
 void PFM_Control_Update(float i1_set, float i1_meas, 
@@ -256,59 +291,77 @@ void PFM_Control_Update(float i1_set, float i1_meas,
   }
 }
 
-/* Timer interrupt callback moved from main.c */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-  /* BO PFM #1: TIM3 -> PC6/PB5 */
+  /* BO PFM #1 & #2: Dung chung TIM3 */
   if (htim->Instance == TIM3) {
-    pwm1_cnt++;
-    uint8_t N_target = (pwm1_group == 0) ? pfm1_N1 : (pfm1_N2 * 3);
-
-    if (pwm1_cnt >= N_target) {
-      pwm1_cnt = 0;
-      pwm1_group = 1 - pwm1_group;
-      pwm1_pol = 1 - pwm1_pol;
-      if (pwm1_pol) {
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
-      } else {
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);
+    // ---- BO PFM #1: PC6/PB5 ----
+    if (pwm1_group == 0) {
+      pwm1_pol ^= 1U;
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, pwm1_pol ? GPIO_PIN_SET : GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, pwm1_pol ? GPIO_PIN_RESET : GPIO_PIN_SET);
+      pwm1_cnt++;
+      if (pwm1_cnt >= pfm1_N1) {
+        pwm1_group = 1;
+        pwm1_cnt = 0;
+      }
+    } else {
+      pwm1_cnt++;
+      if ((pwm1_cnt % 3U) == 0U) {
+        pwm1_pol ^= 1U;
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, pwm1_pol ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, pwm1_pol ? GPIO_PIN_RESET : GPIO_PIN_SET);
+      }
+      if (pwm1_cnt >= (pfm1_N2 * 3U)) {
+        pwm1_group = 0;
+        pwm1_cnt = 0;
       }
     }
 
-    /* BO PFM #2: TIM3 -> PC8/PC9 (Dung chung TIM3) */
-    pwm2_cnt++;
-    uint8_t N2_target = (pwm2_group == 0) ? pfm2_N1 : (pfm2_N2 * 3);
-
-    if (pwm2_cnt >= N2_target) {
-      pwm2_cnt = 0;
-      pwm2_group = 1 - pwm2_group;
-      pwm2_pol = 1 - pwm2_pol;
-      if (pwm2_pol) {
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_SET);
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_RESET);
-      } else {
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_SET);
+    // ---- BO PFM #2: PC8/PC9 ----
+    if (pwm2_group == 0) {
+      pwm2_pol ^= 1U;
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, pwm2_pol ? GPIO_PIN_SET : GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, pwm2_pol ? GPIO_PIN_RESET : GPIO_PIN_SET);
+      pwm2_cnt++;
+      if (pwm2_cnt >= pfm2_N1) {
+        pwm2_group = 1;
+        pwm2_cnt = 0;
+      }
+    } else {
+      pwm2_cnt++;
+      if ((pwm2_cnt % 3U) == 0U) {
+        pwm2_pol ^= 1U;
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_8, pwm2_pol ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, pwm2_pol ? GPIO_PIN_RESET : GPIO_PIN_SET);
+      }
+      if (pwm2_cnt >= (pfm2_N2 * 3U)) {
+        pwm2_group = 0;
+        pwm2_cnt = 0;
       }
     }
   }
 
   /* BO PFM #3: TIM1 -> PE9/PE11 */
   if (htim->Instance == TIM1) {
-    pwm3_cnt++;
-    uint8_t N3_target = (pwm3_group == 0) ? pfm3_N1 : (pfm3_N2 * 3);
-
-    if (pwm3_cnt >= N3_target) {
-      pwm3_cnt = 0;
-      pwm3_group = 1 - pwm3_group;
-      pwm3_pol = 1 - pwm3_pol;
-      if (pwm3_pol) {
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_SET);
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11, GPIO_PIN_RESET);
-      } else {
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11, GPIO_PIN_SET);
+    if (pwm3_group == 0) {
+      pwm3_pol ^= 1U;
+      HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, pwm3_pol ? GPIO_PIN_SET : GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11, pwm3_pol ? GPIO_PIN_RESET : GPIO_PIN_SET);
+      pwm3_cnt++;
+      if (pwm3_cnt >= pfm3_N1) {
+        pwm3_group = 1;
+        pwm3_cnt = 0;
+      }
+    } else {
+      pwm3_cnt++;
+      if ((pwm3_cnt % 3U) == 0U) {
+        pwm3_pol ^= 1U;
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, pwm3_pol ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11, pwm3_pol ? GPIO_PIN_RESET : GPIO_PIN_SET);
+      }
+      if (pwm3_cnt >= (pfm3_N2 * 3U)) {
+        pwm3_group = 0;
+        pwm3_cnt = 0;
       }
     }
   }

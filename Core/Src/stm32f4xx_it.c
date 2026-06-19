@@ -59,7 +59,7 @@ extern DMA_HandleTypeDef hdma_adc1;
 extern TIM_HandleTypeDef htim3;
 extern UART_HandleTypeDef huart3;
 /* USER CODE BEGIN EV */
-
+extern TIM_HandleTypeDef htim1;
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -257,5 +257,11 @@ void DMA2_Stream0_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
-
+/**
+  * @brief This function handles TIM1 Update interrupt and TIM10 global interrupt.
+  */
+void TIM1_UP_TIM10_IRQHandler(void)
+{
+  HAL_TIM_IRQHandler(&htim1);
+}
 /* USER CODE END 1 */
